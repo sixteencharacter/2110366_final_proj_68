@@ -47,6 +47,7 @@ typedef enum
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
@@ -58,6 +59,24 @@ UART_HandleTypeDef huart2;
 volatile SystemState_t currentState = STATE_IDLE;
 static char uart_buf[64];
 static uint32_t t_ms = 0;
+
+// --- DMA BUFFER ---
+// [0] = Microphone, [1] = Heartbeat
+uint32_t adc_buffer[2];
+
+// --- MICROPHONE VARIABLES ---
+uint32_t mic_max = 0;
+uint32_t mic_min = 4095;
+uint32_t mic_val = 0;       // The final "Volume" value
+uint32_t mic_last_reset = 0; // Timer for the 50ms window
+
+// --- TALK DETECTION SETTINGS ---
+#define MIC_THRESHOLD  800   // Volume above this = Talking (Tune this!)
+#define HANG_TIME_MS   5000  // How long to wait before deciding speech stopped
+
+// --- TALK DETECTION VARIABLES ---
+uint8_t is_talking = 0;       // The final output: 1 = Talking, 0 = Quiet
+uint32_t silence_timer = 0;   // Timer to track silence
 
 /* ===== BPM Variables ===== */
 static float dc = 0.0f; // DC tracker
@@ -108,6 +127,7 @@ int mic_val = 0;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM1_Init(void);
@@ -166,7 +186,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     {
       // เปลี่ยนสถานะ -> RECORDING
       // เดี๋ยวใน main loop จะจัดการหยุด ADC หัวใจเอง
-    Calculate_Baseline();
+      Calculate_Baseline();
       currentState = STATE_RECORDING;
     }
     else if (currentState == STATE_RECORDING)
@@ -181,38 +201,75 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
   if (hadc->Instance != ADC1)
     return;
 
-  uint16_t raw = HAL_ADC_GetValue(&hadc1);
+  uint16_t raw_mic = (uint16_t)adc_buffer[0];
+  uint16_t raw_heart = (uint16_t)adc_buffer[1];
   t_ms = HAL_GetTick();
 
-  /* 1) DC removal + low-pass */
-  float rawf = (float)raw;
+  // ==========================================
+  // PART A: MICROPHONE LOGIC (Talking Detect)
+  // ==========================================
+
+  // 1. Update Min/Max
+  if (raw_mic > mic_max)
+    mic_max = raw_mic;
+  if (raw_mic < mic_min)
+    mic_min = raw_mic;
+
+  // 2. Every 50ms check the volume
+  if (t_ms - mic_last_reset > 50)
+  {
+    mic_val = mic_max - mic_min; // Calculate Volume
+
+    // --- LOGIC: IS SOMEONE TALKING? ---
+    if (mic_val > MIC_THRESHOLD)
+    {
+      // Heard noise! Reset the silence timer.
+      is_talking = 1;
+      silence_timer = t_ms;
+    }
+    else
+    {
+      // It's quiet... but has it been quiet for long enough?
+      if (t_ms - silence_timer > HANG_TIME_MS)
+      {
+        is_talking = 0; // Okay, they effectively stopped talking.
+      }
+    }
+
+    // Reset Min/Max for next window
+    mic_max = 0;
+    mic_min = 4095;
+    mic_last_reset = t_ms;
+  }
+  // ==========================================
+  // PART B: HEARTBEAT LOGIC (Your Original DSP)
+  // ==========================================
+  // We use 'raw_heart' instead of calling HAL_ADC_GetValue()
+  float rawf = (float)raw_heart;
+
+  // --- (Your Exact Existing DSP Code) ---
   float err = rawf - dc;
   dc += ALPHA_DC * err;
   float sig = rawf - dc;
   y += ALPHA_LP * (sig - y);
 
-  /* 2) Adaptive threshold base */
   float ay = (y >= 0) ? y : -y;
   thr_ema = 0.995f * thr_ema + 0.005f * ay;
 
-  /* ฮิสทีรีซิสสองระดับ */
   float thr_hi = THR_SCALE_HI * thr_ema;
   float thr_lo = THR_SCALE_LO * thr_hi;
 
-  /* refractory handle */
   if (refractory && (t_ms - ref_start_ms) > REFRACT_MS)
   {
     refractory = 0;
   }
 
-  /* 3) Peak detect with hysteresis */
   float dy = y - y_prev;
 
   if (!refractory)
   {
     if (!peak_armed)
     {
-      // รอข้ามขึ้นเหนือ thr_hi เพื่อ "เล็ง" peek
       if (y > thr_hi)
       {
         peak_armed = 1;
@@ -220,7 +277,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     }
     else
     {
-      // armed แล้ว: รอหล่นต่ำกว่า thr_lo และมีสโลปลง (dy<0) -> นับ 1 beat
       if (y < thr_lo && dy < 0.0f)
       {
         uint32_t now = t_ms;
@@ -230,41 +286,37 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
           if (ibi >= IBI_MIN_MS && ibi <= IBI_MAX_MS)
           {
             float bpm_raw = 60000.0f / (float)ibi;
-            bpm = BPM_SMOOTH_A * bpm + (1.0f - BPM_SMOOTH_A) * bpm_raw; // smooth
+            bpm = BPM_SMOOTH_A * bpm + (1.0f - BPM_SMOOTH_A) * bpm_raw;
 
+            // Your logic for saving BPM to buffer
             if (currentState == STATE_IDLE)
             {
-                //Baseline (Circular Buffer)
-                bpm_buffer[bpm_idx] = bpm;
-                bpm_idx = (bpm_idx + 1) % 30;
-                if(bpm_count_base < 30) bpm_count_base++;
-             }
-
+              bpm_buffer[bpm_idx] = bpm;
+              bpm_idx = (bpm_idx + 1) % 30;
+              if (bpm_count_base < 30)
+                bpm_count_base++;
+            }
           }
         }
-        else
-        {
-          // first valid peak — ไม่คำนวณ bpm ยัง (ต้องมี 2 ช่วงเวลา)
-        }
         last_peak_ms = now;
-
         beep_req = 1;
         beep_until = t_ms + BEEP_MS;
-
-        // กันเด้ง + ปลดการเล็ง
         refractory = 1;
         ref_start_ms = now;
         peak_armed = 0;
       }
     }
   }
-
   y_prev = y;
 
-  /* 4) ส่ง CSV: t_ms,raw,filt,bpm */
+  // ==========================================
+  // PART C: OUTPUT
+  // ==========================================
+  // I added "is_talking" to the end of the CSV
   int n = snprintf(uart_buf, sizeof(uart_buf),
-                   "%lu,%u,%.2f,%.1f,%u\r\n",
-                   t_ms, raw, y, bpm, mic_val);
+                   "%lu,%u,%.2f,%.1f,%lu,%u\r\n",
+                   t_ms, raw_heart, y, bpm, mic_val, is_talking);
+
   HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, n, 10);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, n, 10);
 }
@@ -299,6 +351,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
   MX_TIM1_Init();
@@ -310,6 +363,19 @@ int main(void)
   HAL_TIM_OC_Start_IT(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, (uint32_t)(htim2.Init.Period * BUZZER_VOLUME));
+
+  if (HAL_ADC_Start_DMA(&hadc1, adc_buffer, 2) != HAL_OK)
+  {
+      // If this fails, blink LED rapidly to warn user
+      while(1) {
+          HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+          HAL_Delay(100);
+      }
+  }
+
+  printf("System Initialized.\r\n");
+  printf("Current State: IDLE. Press Blue Button to Record.\r\n");
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -348,12 +414,11 @@ int main(void)
 
       /* --- STATE 2: RECORDING (วัดไมค์ IN2) --- */
       case STATE_RECORDING:
-    	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
-    	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
-        // BEGIN CODE FOR BOON //
-
+    	if (is_talking == 1){
+    	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
+    	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+    	}
         // END CODE FOR BOON //
-        HAL_ADC_Stop_IT(&hadc1);
         break;
 
       case STATE_PROCESSING:
@@ -503,13 +568,13 @@ static void MX_ADC1_Init(void)
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc1.Init.ScanConvMode = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.ScanConvMode = ENABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
   hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T1_CC1;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.NbrOfConversion = 2;
   hadc1.Init.DMAContinuousRequests = DISABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -521,7 +586,16 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Rank = 2;
+  sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -729,6 +803,22 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
 
