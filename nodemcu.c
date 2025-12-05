@@ -91,8 +91,8 @@ void loop() {
     // Serial.println("Serial Received [RAW]: " + getValue(message,',',0));
     // Serial.println("Serial Received [BPM]: " + getValue(message,',',3));
     if(counter % 100 == 0) {
-      String msg_sample = "{\"data\" : {\"raw\" : ";
-      msg_sample += getValue(message,',',1) + "," +  "\"bpm\" : " + getValue(message,',',3) + " }}";
+      String msg_sample = "{\"data\" : {\"gameState\" : ";
+      msg_sample += getValue(message,',',0) + "," +  "\"result\" : " + getValue(message,',',1) + "," +  "\"bpm\" : " + getValue(message,',',2) + "," +  "\"micOn\" : " + getValue(message,',',3) +" }}";
       Serial.println(msg_sample);
       client.publish((char*)"@shadow/data/update",msg_sample.c_str());
       counter = 0;

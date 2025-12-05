@@ -103,6 +103,9 @@ static volatile uint32_t beep_until = 0; // เวลาที่จะหยุ
 int now = 0;
 int prev = 0; // ระยะเวลาบี๊บ 60ms
 int mic_val = 0;
+char *currentStateStr = "idle";
+int8_t micOn = 0;
+int8_t result = -1;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -166,11 +169,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     {
       // เปลี่ยนสถานะ -> RECORDING
       // เดี๋ยวใน main loop จะจัดการหยุด ADC หัวใจเอง
-    Calculate_Baseline();
+      Calculate_Baseline();
+      currentStateStr = "start";
       currentState = STATE_RECORDING;
     }
     else if (currentState == STATE_RECORDING)
     {
+      currentStateStr = "calibrate";
       currentState = STATE_PROCESSING;
     }
   }
@@ -262,9 +267,11 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
   y_prev = y;
 
   /* 4) ส่ง CSV: t_ms,raw,filt,bpm */
+
+
   int n = snprintf(uart_buf, sizeof(uart_buf),
-                   "%lu,%u,%.2f,%.1f,%u\r\n",
-                   t_ms, raw, y, bpm, mic_val);
+                   "%s,%d,%.1f,%d\r\n",
+                   currentStateStr, result, bpm, micOn);
   HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, n, 10);
   HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, n, 10);
 }
@@ -341,8 +348,9 @@ int main(void)
     {
     /* --- STATE 1: IDLE (วัดหัวใจทำงานอยู่เบื้องหลัง) --- */
       case STATE_IDLE:
+    	  result = -1;
     	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-    	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
+    	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
 
         break;
 
@@ -380,6 +388,7 @@ int main(void)
 
           // ไปหน้าแสดงผล
           currentState = STATE_RESULT;
+          currentStateStr = "result";
         }
         break;
       case STATE_RESULT:
@@ -411,6 +420,7 @@ int main(void)
     		HAL_Delay(1000);
     		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(0));
     		__HAL_TIM_SET_COUNTER(&htim2, 0);
+    		result = 1;
     	}
     	else{
     		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(250));
@@ -424,11 +434,13 @@ int main(void)
     		HAL_Delay(1000);
     		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(0));
     		__HAL_TIM_SET_COUNTER(&htim2, 0);
+    		result = 0;
     	}
 
 
         HAL_ADC_Start_IT(&hadc1);
         currentState = STATE_IDLE;
+        currentStateStr = "idle";
       }
   }
   /* USER CODE END 3 */
