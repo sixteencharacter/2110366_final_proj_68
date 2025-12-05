@@ -69,10 +69,11 @@ uint32_t mic_max = 0;
 uint32_t mic_min = 4095;
 uint32_t mic_val = 0;       // The final "Volume" value
 uint32_t mic_last_reset = 0; // Timer for the 50ms window
+int flag = 0;
 
 // --- TALK DETECTION SETTINGS ---
-#define MIC_THRESHOLD  800   // Volume above this = Talking (Tune this!)
-#define HANG_TIME_MS   5000  // How long to wait before deciding speech stopped
+#define MIC_THRESHOLD  750   // Volume above this = Talking (Tune this!)
+#define HANG_TIME_MS   7000  // How long to wait before deciding speech stopped
 
 // --- TALK DETECTION VARIABLES ---
 uint8_t is_talking = 0;       // The final output: 1 = Talking, 0 = Quiet
@@ -183,141 +184,158 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     prev = now;
     if (currentState == STATE_IDLE)
     {
-      // เปลี่ยนสถานะ -> RECORDING
-      // เดี๋ยวใน main loop จะจัดการหยุด ADC หัวใจเอง
+
       Calculate_Baseline();
       currentState = STATE_RECORDING;
     }
-    else if (currentState == STATE_RECORDING)
-    {
-      currentState = STATE_PROCESSING;
-    }
+
   }
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-  if (hadc->Instance != ADC1)
-    return;
+  if (hadc->Instance != ADC1) return;
 
+  // อ่านค่า ADC จาก DMA Buffer
+  // เราอ่านมารอไว้ก่อน แต่จะยังไม่คำนวณถ้าเวลายังไม่ถึง
   uint16_t raw_mic = (uint16_t)adc_buffer[0];
   uint16_t raw_heart = (uint16_t)adc_buffer[1];
+
   t_ms = HAL_GetTick();
+
+  // ============================================================
+  // [FIX] LIMIT CALCULATION RATE TO ~100Hz (Every 10ms)
+  // ============================================================
+  static uint32_t last_dsp_time = 0;
+
+  // ถ้าผ่านไปไม่ถึง 10ms ให้ข้ามการคำนวณไปเลย (เพื่อลดความเร็ว Loop)
+  if (t_ms - last_dsp_time < 10)
+  {
+      return;
+  }
+  last_dsp_time = t_ms; // อัปเดตเวลาล่าสุดที่คำนวณ
+
+  // --- จากจุดนี้ไปคือ Code เดิมของคุณ ---
+  // พอเราจำกัดเวลาเข้า Loop นี้ให้เหลือ 10ms ต่อครั้ง
+  // สูตร ALPHA_DC และ ALPHA_LP ของคุณจะกลับมาทำงานได้ถูกต้องทันทีครับ
 
   // ==========================================
   // PART A: MICROPHONE LOGIC (Talking Detect)
   // ==========================================
 
   // 1. Update Min/Max
-  if (raw_mic > mic_max)
-    mic_max = raw_mic;
-  if (raw_mic < mic_min)
-    mic_min = raw_mic;
+  if (raw_mic > mic_max) mic_max = raw_mic;
+  if (raw_mic < mic_min) mic_min = raw_mic;
 
   // 2. Every 50ms check the volume
+  // (Logic เดิมของคุณตรงนี้โอเคแล้ว แต่มันจะทำงานแม่นขึ้นเพราะ Loop นิ่งขึ้น)
   if (t_ms - mic_last_reset > 50)
   {
-    mic_val = mic_max - mic_min; // Calculate Volume
-
-    // --- LOGIC: IS SOMEONE TALKING? ---
-    if (mic_val > MIC_THRESHOLD)
-    {
-      // Heard noise! Reset the silence timer.
-      is_talking = 1;
-      silence_timer = t_ms;
+    mic_val = mic_max - mic_min;
+    if(currentState == STATE_RECORDING ){
+    	if (mic_val > MIC_THRESHOLD)
+    	    {
+    	      is_talking = 1;
+    	      silence_timer = t_ms;
+    	      flag = 1;
+    	    }
+    	else
+    	    {
+    	      if (t_ms - silence_timer > HANG_TIME_MS && flag != 0)
+				  {
+					is_talking = 0;
+					flag = 0;
+					currentState = STATE_PROCESSING;
+				  }
+    	    }
     }
-    else
-    {
-      // It's quiet... but has it been quiet for long enough?
-      if (t_ms - silence_timer > HANG_TIME_MS)
-      {
-        is_talking = 0; // Okay, they effectively stopped talking.
-      }
-    }
 
-    // Reset Min/Max for next window
     mic_max = 0;
     mic_min = 4095;
     mic_last_reset = t_ms;
   }
+
   // ==========================================
-  // PART B: HEARTBEAT LOGIC (Your Original DSP)
+  // PART B: HEARTBEAT LOGIC
   // ==========================================
-  // We use 'raw_heart' instead of calling HAL_ADC_GetValue()
-  float rawf = (float)raw_heart;
 
-  // --- (Your Exact Existing DSP Code) ---
-  float err = rawf - dc;
-  dc += ALPHA_DC * err;
-  float sig = rawf - dc;
-  y += ALPHA_LP * (sig - y);
+    float rawf = (float)raw_heart;
+    float err = rawf - dc;
+    dc += ALPHA_DC * err;
+    float sig = rawf - dc;
+    y += ALPHA_LP * (sig - y);
 
-  float ay = (y >= 0) ? y : -y;
-  thr_ema = 0.995f * thr_ema + 0.005f * ay;
+    float ay = (y >= 0) ? y : -y;
+    thr_ema = 0.995f * thr_ema + 0.005f * ay;
 
-  float thr_hi = THR_SCALE_HI * thr_ema;
-  float thr_lo = THR_SCALE_LO * thr_hi;
+    float thr_hi = THR_SCALE_HI * thr_ema;
+    float thr_lo = THR_SCALE_LO * thr_hi;
 
-  if (refractory && (t_ms - ref_start_ms) > REFRACT_MS)
-  {
-    refractory = 0;
-  }
-
-  float dy = y - y_prev;
-
-  if (!refractory)
-  {
-    if (!peak_armed)
+    if (refractory && (t_ms - ref_start_ms) > REFRACT_MS)
     {
-      if (y > thr_hi)
-      {
-        peak_armed = 1;
-      }
+      refractory = 0;
     }
-    else
-    {
-      if (y < thr_lo && dy < 0.0f)
-      {
-        uint32_t now = t_ms;
-        if (last_peak_ms != 0)
-        {
-          uint32_t ibi = now - last_peak_ms;
-          if (ibi >= IBI_MIN_MS && ibi <= IBI_MAX_MS)
-          {
-            float bpm_raw = 60000.0f / (float)ibi;
-            bpm = BPM_SMOOTH_A * bpm + (1.0f - BPM_SMOOTH_A) * bpm_raw;
 
-            // Your logic for saving BPM to buffer
-            if (currentState == STATE_IDLE)
+    float dy = y - y_prev;
+
+    if (!refractory)
+    {
+      if (!peak_armed)
+      {
+        if (y > thr_hi)
+        {
+          peak_armed = 1;
+        }
+      }
+      else
+      {
+        if (y < thr_lo && dy < 0.0f)
+        {
+          uint32_t now = t_ms;
+          if (last_peak_ms != 0)
+          {
+            uint32_t ibi = now - last_peak_ms;
+
+            // [OPTIONAL] ปรับช่วง IBI ให้กว้างขึ้นนิดหน่อยเผื่อหัวใจเต้นเร็ว/ช้าผิดปกติ
+            if (ibi >= 300 && ibi <= 2000)
             {
-              bpm_buffer[bpm_idx] = bpm;
-              bpm_idx = (bpm_idx + 1) % 30;
-              if (bpm_count_base < 30)
-                bpm_count_base++;
+              float bpm_raw = 60000.0f / (float)ibi;
+              bpm = BPM_SMOOTH_A * bpm + (1.0f - BPM_SMOOTH_A) * bpm_raw;
+
+              if (currentState == STATE_IDLE)
+              {
+                  bpm_buffer[bpm_idx] = bpm;
+                  bpm_idx = (bpm_idx + 1) % 30;
+                  if(bpm_count_base < 30) bpm_count_base++;
+               }
+               // อย่าลืม Logic นับ Response ใน State Recording
+               else if (currentState == STATE_RECORDING)
+               {
+                  response_sum += bpm;
+                  response_count++;
+               }
             }
           }
+          last_peak_ms = now;
+
+          beep_req = 1;
+          beep_until = t_ms + BEEP_MS;
+
+          refractory = 1;
+          ref_start_ms = now;
+          peak_armed = 0;
         }
-        last_peak_ms = now;
-        beep_req = 1;
-        beep_until = t_ms + BEEP_MS;
-        refractory = 1;
-        ref_start_ms = now;
-        peak_armed = 0;
       }
     }
-  }
-  y_prev = y;
 
-  // ==========================================
-  // PART C: OUTPUT
-  // ==========================================
-  // I added "is_talking" to the end of the CSV
-  int n = snprintf(uart_buf, sizeof(uart_buf),
-                   "%lu,%u,%.2f,%.1f,%lu,%u\r\n",
-                   t_ms, raw_heart, y, bpm, mic_val, is_talking);
+    y_prev = y;
 
-  HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, n, 10);
-  HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, n, 10);
+    // ส่ง UART ทุกครั้งที่คำนวณเสร็จ (ซึ่งตอนนี้คือทุก 10ms = 100Hz พอดี ไม่รกเกินไป)
+    int n = snprintf(uart_buf, sizeof(uart_buf),
+                       "%lu,%u,%.2f,%.1f,%lu,%u\r\n",
+                       t_ms, raw_heart, y, bpm, mic_val, is_talking);
+    HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, n, 10);
+    // HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, n, 10); // ปิดอันนี้ถ้าไม่ได้ใช้ จะได้ไม่หน่วง
 }
 /* USER CODE END 0 */
 
@@ -358,10 +376,10 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start_IT(&htim1);
-  HAL_ADC_Start_IT(&hadc1);
+//  HAL_ADC_Start_IT(&hadc1);
   HAL_TIM_OC_Start_IT(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, (uint32_t)(htim2.Init.Period * BUZZER_VOLUME));
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
 
   if (HAL_ADC_Start_DMA(&hadc1, adc_buffer, 2) != HAL_OK)
   {
@@ -387,40 +405,45 @@ int main(void)
 
     uint32_t now = HAL_GetTick();
     if (beep_req)
-    {
-      if (now < beep_until)
-      {
-        // เปิดเสียงโน้ตเดิมของคุณ (NOTE_C4) ด้วย presForFrequency()
-        __HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(NOTE_C4));
-        __HAL_TIM_SET_COUNTER(&htim2, 0); // ให้มีผลทันที (แนะนำ)
-      }
-      else
-      {
-        // ครบเวลา -> ปิดเสียงกลับเป็น 0 Hz
-        __HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(0));
-        __HAL_TIM_SET_COUNTER(&htim2, 0);
-        beep_req = 0; // เคลียร์คำสั่งบี๊บครั้งนี้
-      }
-    }
+        {
+          if (now < beep_until)
+          {
+            // 1. ตั้งความถี่
+            __HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(NOTE_C4));
+            __HAL_TIM_SET_COUNTER(&htim2, 0);
+
+            // 2. [เพิ่ม] เปิดเสียง (Volume 50%)
+            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, (htim2.Init.Period + 1) / 2);
+          }
+          else
+          {
+            // 1. [สำคัญ] ปิดเสียง (Volume 0%)
+            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+
+            beep_req = 0;
+          }
+        }
     switch (currentState)
     {
     /* --- STATE 1: IDLE (วัดหัวใจทำงานอยู่เบื้องหลัง) --- */
       case STATE_IDLE:
+    	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
     	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
-    	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
+    	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET); // ปิดไฟ Recording
+
+    	  // เปิดไฟ Idle
+    	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
 
         break;
 
       /* --- STATE 2: RECORDING (วัดไมค์ IN2) --- */
       case STATE_RECORDING:
-    	if (is_talking == 1){
-    	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
-    	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
-    	}
-        // END CODE FOR BOON //
-        break;
+    	  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET); // ดับไฟ Idle
+    	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);   // ติดไฟ Talking
+    	  break;
 
       case STATE_PROCESSING:
+    	HAL_ADC_Stop_DMA(&hadc1);
     	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
     	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
         if (state_timer == 0)
@@ -491,7 +514,7 @@ int main(void)
     	}
 
 
-        HAL_ADC_Start_IT(&hadc1);
+    	HAL_ADC_Start_DMA(&hadc1, adc_buffer, 2);
         currentState = STATE_IDLE;
       }
   }
@@ -574,7 +597,7 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T1_CC1;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.NbrOfConversion = 2;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
