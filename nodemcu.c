@@ -11,21 +11,8 @@ PubSubClient client(espClient);
 HardwareSerial STMSerial(2);
 
 String message;
-int counter = 0;
 
-// WiFi
-const char *ssid = <wifi SSID>; // Enter your WiFi name
-const char *password = <password>;  // Enter WiFi password
-
-// MQTT Broker
-const char *mqtt_broker = <broker>;
-const char *topic = <topic>;
-const char *mqtt_username = <username>;
-const char *mqtt_password = <password>;
-const char *client_id = <client id>;
-const char *token = <token>;
-const char *secret = <secret>;
-const int mqtt_port = <port>;
+// [credentials are redacted]
 
 void setup() {
   // Set software serial baud to 115200;
@@ -46,7 +33,7 @@ void setup() {
 
   while (!client.connected()) {
       Serial.printf("The client %s connects to the public MQTT broker\n", WiFi.macAddress().c_str());
-      if (client.connect(client_id, token, secret)) {
+      if (client.connect(client_id)) {
           Serial.println("NETPIE MQTT broker connected");
       } else {
           Serial.print("failed with state ");
@@ -54,7 +41,7 @@ void setup() {
           delay(2000);
       }
   }
-  client.subscribe((char*)"@msg/#");
+  // client.subscribe((char*)"msg/data");
 }
 
 void callback(char *topic, byte *payload, unsigned int length) {
@@ -90,14 +77,10 @@ void loop() {
     message = STMSerial.readStringUntil('\n');
     // Serial.println("Serial Received [RAW]: " + getValue(message,',',0));
     // Serial.println("Serial Received [BPM]: " + getValue(message,',',3));
-    if(counter % 100 == 0) {
-      String msg_sample = "{\"data\" : {\"raw\" : ";
-      msg_sample += getValue(message,',',1) + "," +  "\"bpm\" : " + getValue(message,',',3) + " }}";
-      Serial.println(msg_sample);
-      client.publish((char*)"@shadow/data/update",msg_sample.c_str());
-      counter = 0;
-    }
-    counter++;
+    
+    String msg_sample = "{\"gameState\" : \"";
+    msg_sample += getValue(message,',',0) + "\"," +  "\"result\" : " + getValue(message,',',1) + "," + "\"bpm\" : " + getValue(message,',',2) + "," + "\"micOn\" : " +  getValue(message,',',3) + "}";
+    Serial.println(msg_sample);
+    client.publish((char*)"msg/data",msg_sample.c_str());
   }
 }
-
