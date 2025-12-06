@@ -72,7 +72,7 @@ uint32_t mic_last_reset = 0; // Timer for the 50ms window
 int flag = 0;
 
 // --- TALK DETECTION SETTINGS ---
-#define MIC_THRESHOLD  750   // Volume above this = Talking (Tune this!)
+#define MIC_THRESHOLD  500   // Volume above this = Talking (Tune this!)
 #define HANG_TIME_MS   7000  // How long to wait before deciding speech stopped
 
 // --- TALK DETECTION VARIABLES ---
@@ -103,11 +103,11 @@ int response_count = 0;     // n
 
 /* ===== Other Config ===== */
 #define ALPHA_DC 0.01f
-#define ALPHA_LP 0.20f
+#define ALPHA_LP 0.75f
 
 #define THR_SCALE_HI 0.90f // threshold บน (เข้มขึ้นเพื่อลดนับซ้ำ)
-#define THR_SCALE_LO 0.50f // threshold ล่าง = สัดส่วนของ threshold บน
-#define REFRACT_MS 300     // กันเด้ง 300ms
+#define THR_SCALE_LO 0.40f // threshold ล่าง = สัดส่วนของ threshold บน
+#define REFRACT_MS 450     // กันเด้ง 300ms
 #define IBI_MIN_MS 350     // 60000/171BPM ~ 350ms  (กัน BPM สูงเกิน)
 #define IBI_MAX_MS 2000    // 30 BPM
 
@@ -140,8 +140,19 @@ int Read_Mic_Polling(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 // char rx_data[1] = 'A';
+char state_str[20] = "idle"; // ตั้งค่าเริ่มต้นกันเหนียว
+void Update_State_String(SystemState_t state){
+	switch(state)
+	    {
+	        case STATE_IDLE:       sprintf(state_str, "IDLE");       break;
+	        case STATE_RECORDING:  sprintf(state_str, "RECORDING");  break;
+	        case STATE_PROCESSING: sprintf(state_str, "PROCESSING"); break;
+	        case STATE_RESULT:     sprintf(state_str, "RESULT");     break;
+	        default:               sprintf(state_str, "UNKNOWN");    break;
+	    }
+}
 
-int mic_value = 0;
+
 int presForFrequency(int frequency)
 {
   if (frequency <= 0)
@@ -149,7 +160,6 @@ int presForFrequency(int frequency)
   /* PSC = TIM_FREQ / ((ARR+1) * f) - 1 */
   return (int)((TIM_FREQ / ((uint64_t)(htim1.Init.Period + 1) * (uint64_t)frequency)) - 1);
 }
-
 void Calculate_Baseline(void)
 {
     if (bpm_count_base < 2) {
@@ -331,11 +341,13 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     y_prev = y;
 
     // ส่ง UART ทุกครั้งที่คำนวณเสร็จ (ซึ่งตอนนี้คือทุก 10ms = 100Hz พอดี ไม่รกเกินไป)
-    int n = snprintf(uart_buf, sizeof(uart_buf),
-                       "%lu,%u,%.2f,%.1f,%lu,%u\r\n",
-                       t_ms, raw_heart, y, bpm, mic_val, is_talking);
+//    int n = snprintf(uart_buf, sizeof(uart_buf),
+//                       "%lu,%u,%s,%.1f,%lu,%u\r\n",
+//                       t_ms, raw_heart, state_str, bpm, mic_val, is_talking);
+//
+    int n = snprintf(uart_buf, sizeof(uart_buf),"%s,%d,%.1f,%d\r\n",state_str,-1,bpm, is_talking);
     HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, n, 10);
-    // HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, n, 10); // ปิดอันนี้ถ้าไม่ได้ใช้ จะได้ไม่หน่วง
+    HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, n, 10); // ปิดอันนี้ถ้าไม่ได้ใช้ จะได้ไม่หน่วง
 }
 /* USER CODE END 0 */
 
@@ -379,7 +391,7 @@ int main(void)
 //  HAL_ADC_Start_IT(&hadc1);
   HAL_TIM_OC_Start_IT(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, (uint32_t)(htim2.Init.Period * BUZZER_VOLUME));
 
   if (HAL_ADC_Start_DMA(&hadc1, adc_buffer, 2) != HAL_OK)
   {
@@ -402,23 +414,30 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
+	  switch(currentState)
+	  	    {
+	  	        case STATE_IDLE:       sprintf(state_str, "idle");       break;
+	  	        case STATE_RECORDING:  sprintf(state_str, "recording");  break;
+	  	        case STATE_PROCESSING: sprintf(state_str, "processing"); break;
+	  	        case STATE_RESULT:     sprintf(state_str, "result");     break;
+	  	        default:               sprintf(state_str, "default");    break;
+	  	    }
     uint32_t now = HAL_GetTick();
     if (beep_req)
         {
           if (now < beep_until)
           {
             // 1. ตั้งความถี่
-            __HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(NOTE_C4));
+            __HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(250));
             __HAL_TIM_SET_COUNTER(&htim2, 0);
 
             // 2. [เพิ่ม] เปิดเสียง (Volume 50%)
-            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, (htim2.Init.Period + 1) / 2);
           }
           else
           {
             // 1. [สำคัญ] ปิดเสียง (Volume 0%)
-            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);
+        	__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(0));
+        	__HAL_TIM_SET_COUNTER(&htim2, 0);
 
             beep_req = 0;
           }
@@ -446,6 +465,10 @@ int main(void)
     	HAL_ADC_Stop_DMA(&hadc1);
     	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
     	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
+    	int n = snprintf(uart_buf, sizeof(uart_buf),"%s,%d,%.1f,%d\r\n", state_str,-1,0.0,0);
+    	HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, n, 10);
+    	HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, n, 10); // ปิดอันนี้ถ้าไม่ได้ใช้ จะได้ไม่หน่วง
+    	HAL_Delay(100);
         if (state_timer == 0)
         {
           state_timer = now; // เริ่มจับเวลา
@@ -453,6 +476,8 @@ int main(void)
 //          HAL_ADC_Start_IT(&hadc1);
           // ไฟกระพริบถี่ๆ บอกสถานะ Processing
           HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+
+
         }
 
 
@@ -464,6 +489,7 @@ int main(void)
 
           // รีเซ็ต timer สำหรับรอบหน้า
           state_timer = 0;
+
 
           // ไปหน้าแสดงผล
           currentState = STATE_RESULT;
@@ -487,31 +513,36 @@ int main(void)
     	// Z-Score
     	float z_score = (response_mean - baseline_mean) / std_error;
     	if (z_score > 1.645f){
-    		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(600));
+    		int n = snprintf(uart_buf, sizeof(uart_buf),"%s,%d,%.1f,%d\r\n", state_str,0,0.0,0);
+    		HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, n, 10); // ปิดอันนี้ถ้าไม่ได้ใช้ จะได้ไม่หน่วง
+//    		HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, n, 10);
+
+    		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(1000));
     		__HAL_TIM_SET_COUNTER(&htim2, 0);
     		HAL_Delay(1000);
     		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(0));
     		__HAL_TIM_SET_COUNTER(&htim2, 0);
     		HAL_Delay(1000);
-    		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(600));
+    		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(1000));
     		__HAL_TIM_SET_COUNTER(&htim2, 0);
     		HAL_Delay(1000);
     		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(0));
     		__HAL_TIM_SET_COUNTER(&htim2, 0);
+
     	}
     	else{
+    		int n = snprintf(uart_buf, sizeof(uart_buf),"%s,%d,%.1f,%d\r\n", state_str,1,0.0,0);
+//    		HAL_UART_Transmit(&huart2, (uint8_t *)uart_buf, n, 10);
+    		HAL_UART_Transmit(&huart1, (uint8_t *)uart_buf, n, 10); // ปิดอันนี้ถ้าไม่ได้ใช้ จะได้ไม่หน่วง
     		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(250));
     		__HAL_TIM_SET_COUNTER(&htim2, 0);
     		HAL_Delay(1000);
     		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(0));
     		__HAL_TIM_SET_COUNTER(&htim2, 0);
     		HAL_Delay(1000);
-    		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(250));
-    		__HAL_TIM_SET_COUNTER(&htim2, 0);
-    		HAL_Delay(1000);
-    		__HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(0));
-    		__HAL_TIM_SET_COUNTER(&htim2, 0);
+
     	}
+    	HAL_Delay(5000);
 
 
     	HAL_ADC_Start_DMA(&hadc1, adc_buffer, 2);
