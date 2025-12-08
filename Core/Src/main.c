@@ -428,8 +428,9 @@ int main(void)
           if (now < beep_until)
           {
             // 1. ตั้งความถี่
-            __HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(250));
+            __HAL_TIM_SET_PRESCALER(&htim2, presForFrequency(500));
             __HAL_TIM_SET_COUNTER(&htim2, 0);
+            HAL_Delay(10);
 
             // 2. [เพิ่ม] เปิดเสียง (Volume 50%)
           }
